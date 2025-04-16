@@ -1,4 +1,4 @@
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, FutureExt, Shared, TryFutureExt};
 use thiserror::Error;
 
 use crate::{
@@ -31,7 +31,9 @@ pub enum ServiceError {
     #[error("Mcp error: {0}")]
     McpError(McpError),
     #[error("Transport error: {0}")]
-    Transport(std::io::Error),
+    Transport(#[from] std::io::Error),
+    #[error("Failed to shut down service: {0}")]
+    Shutdown(Arc<tokio::task::JoinError>),
     #[error("Unexpected response type")]
     UnexpectedResponse,
     #[error("task cancelled for reason {}", reason.as_deref().unwrap_or("<unknown>"))]
@@ -195,7 +197,6 @@ use std::{
     sync::{Arc, atomic::AtomicU32},
     time::Duration,
 };
-
 use tokio::sync::mpsc;
 
 pub trait RequestIdProvider: Send + Sync + 'static {
@@ -424,11 +425,13 @@ impl<R: ServiceRole> Peer<R> {
     }
 }
 
+type JoinHandleResult = Result<QuitReason, Arc<tokio::task::JoinError>>;
+
 #[derive(Debug)]
 pub struct RunningService<R: ServiceRole, S: Service<R>> {
     service: Arc<S>,
     peer: Peer<R>,
-    handle: tokio::task::JoinHandle<QuitReason>,
+    handle: Shared<BoxFuture<'static, JoinHandleResult>>,
     /// cancellation token
     ct: CancellationToken,
 }
@@ -449,12 +452,19 @@ impl<R: ServiceRole, S: Service<R>> RunningService<R, S> {
     pub fn service(&self) -> &S {
         self.service.as_ref()
     }
-    pub async fn waiting(self) -> Result<QuitReason, tokio::task::JoinError> {
-        self.handle.await
+    pub async fn waiting(&self) -> Result<QuitReason, ServiceError> {
+        self.handle.clone().await.map_err(ServiceError::Shutdown)
     }
-    pub async fn cancel(self) -> Result<QuitReason, tokio::task::JoinError> {
+    pub async fn cancel(&mut self) -> Result<QuitReason, ServiceError> {
         self.ct.cancel();
         self.waiting().await
+    }
+}
+
+impl<R: ServiceRole, S: Service<R>> Drop for RunningService<R, S> {
+    fn drop(&mut self) {
+        // Cancel the inner service, so that it shuts down and resources are reclaimed
+        self.ct.cancel()
     }
 }
 
@@ -758,7 +768,7 @@ where
     Ok(RunningService {
         service,
         peer: peer_return,
-        handle,
+        handle: handle.map_err(Arc::new).boxed().shared(),
         ct,
     })
 }
